@@ -85,7 +85,7 @@ def _edge_record(root: Path, edge: Any, mapped: dict[str, str]) -> dict:
     location = _relative(root, edge.file_path)
     line = int(edge.line or 0)
     edge_id = hashlib.sha256(
-        json.dumps([edge.id, source or "", target or "", relation, location, line],
+        json.dumps([getattr(edge, "id", None), source or "", target or "", relation, location, line],
                    separators=(",", ":"), ensure_ascii=True).encode("ascii")
     ).hexdigest()
     return {
