@@ -78,7 +78,7 @@ def _edge_record(root: Path, edge: Any, mapped: dict[str, str]) -> dict:
     # call. CRG sometimes has a target spelling that names no indexed node.
     trusted = bool(
         source and target and resolution == "direct"
-        and tier.upper() not in {"INFERRED", "HEURISTIC", "AMBIGUOUS", "UNRESOLVED"}
+        and tier.upper() not in {"UNKNOWN", "INFERRED", "HEURISTIC", "AMBIGUOUS", "UNRESOLVED"}
         and confidence >= 0.8
     )
     relation = str(edge.kind)[:48]
