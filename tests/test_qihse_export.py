@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from code_review_graph.qihse_export import export_qihse_snapshot
+from code_review_graph.qihse_export import export_qihse_snapshot, _worktree_digest
 
 
 class FakeGraph:
@@ -114,3 +114,21 @@ def test_ambiguous_edge_not_promoted(tmp_path):
     edge = [json.loads(line) for line in output.read_text().splitlines()
             if json.loads(line)["t"] == "e"][0]
     assert edge["traversable"] is False
+
+
+def test_dirty_content_changes_without_porcelain_change(tmp_path):
+    root = _repo(tmp_path)
+    tracked = root / "src/a.py"
+    tracked.write_text("def target():\n    return 2\n")
+    baseline = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+        cwd=root, check=True, capture_output=True,
+    ).stdout
+    one = _worktree_digest(root)
+    tracked.write_text("def target():\n    return 3\n")
+    same_status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+        cwd=root, check=True, capture_output=True,
+    ).stdout
+    assert baseline == same_status
+    assert one != _worktree_digest(root)
