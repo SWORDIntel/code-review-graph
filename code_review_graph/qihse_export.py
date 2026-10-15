@@ -25,7 +25,19 @@ def _git(root: Path, *args: str) -> bytes:
         cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=30,
     )
+    if len(result.stdout) > 4 * 1024 * 1024:
+        raise ValueError("Git source diff/status exceeds 4 MiB CodeGraph freshness budget")
     return result.stdout
+
+
+def _worktree_digest(root: Path) -> str:
+    # A stable porcelain filename/status row does NOT imply that the
+    # contents of an already modified tracked source file are unchanged.
+    status = _git(root, "status", "--porcelain=v1", "-z",
+                  "--untracked-files=normal")
+    diff = _git(root, "diff", "--no-ext-diff", "--no-textconv",
+                "--binary", "HEAD", "--")
+    return hashlib.sha256(status + b"\0" + diff).hexdigest()
 
 
 def _relative(root: Path, value: str) -> str:
@@ -109,8 +121,7 @@ def export_qihse_snapshot(store: Any, output_path: Path, repo_root: Path) -> dic
         raise ValueError("QIHSE graph export requires a Git working tree")
 
     previous_head = _git(root, "rev-parse", "--verify", "HEAD").strip().decode("ascii")
-    previous_status = hashlib.sha256(_git(root, "status", "--porcelain=v1",
-                                          "-z", "--untracked-files=normal")).hexdigest()
+    previous_status = _worktree_digest(root)
 
     # Index freshness cannot be inferred from CRG timestamps; validate bytes.
     for original, expected in sorted(store.get_file_hashes().items()):
@@ -174,8 +185,7 @@ def export_qihse_snapshot(store: Any, output_path: Path, repo_root: Path) -> dic
                     counts["unresolved_edges"] += 1
 
             current_head = _git(root, "rev-parse", "--verify", "HEAD").strip().decode("ascii")
-            current_status = hashlib.sha256(_git(root, "status", "--porcelain=v1",
-                                                 "-z", "--untracked-files=normal")).hexdigest()
+            current_status = _worktree_digest(root)
             if (current_head, current_status) != (previous_head, previous_status):
                 raise ValueError("Git worktree changed during graph export; retry")
 
