@@ -111,6 +111,31 @@ The repository is parsed into ASTs with Tree-sitter and stored as a graph of nod
   <img src="diagrams/diagram2_architecture_pipeline.png" alt="Architecture pipeline: Repository to Tree-sitter parser to SQLite graph to blast radius to minimal review set" width="100%" />
 </p>
 
+### QIHSE native CodeGraph export (optional)
+
+CRG can supply a canonical, evidence-preserving structural snapshot to
+the optional native QIHSE CodeGraph runtime. This is a **separate export** from
+the visualization JSON: the latter resolves some ambiguous names heuristically,
+while QIHSE export keeps uncertain edges explicitly non-traversable.
+
+~~~bash
+code-review-graph build
+code-review-graph visualize --format qihse --repo .
+# Produces .code-review-graph/graph.qihse.jsonl
+qihse-codegraph import --repo . --input .code-review-graph/graph.qihse.jsonl
+qihse-codegraph impact --repo . --file src/parser.c
+~~~
+
+The QIHSE process uses QIHSE KV for immutable, crash-recoverable generation
+snapshots and indexed graph adjacency for native impact analysis.
+No source bodies or raw absolute repository paths are included in the export.
+Every snapshot carries a content checksum and Git-worktree identity; source
+hash or worktree changes require rebuilding/updating and republishing.
+
+The exporter uses existing multi-language Tree-sitter and CRG resolutions.
+It does not send code over the network or turn inferred calls into verified ones.
+The required native runtime is maintained separately in the QIHSE repository.
+
 ### Blast-radius analysis
 
 When a file changes, the graph traces every caller, dependent and test that could be affected. The assistant reads those files instead of scanning the whole project.
