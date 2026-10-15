@@ -33,10 +33,13 @@ def _git(root: Path, *args: str) -> bytes:
 def _worktree_digest(root: Path) -> str:
     # A stable porcelain filename/status row does NOT imply that the
     # contents of an already modified tracked source file are unchanged.
+    # Ignore CRG's generated default index/export directory; an in-progress
+    # snapshot must not invalidate its own source fingerprint.
+    selected = ("--", ".", ":(exclude).code-review-graph")
     status = _git(root, "status", "--porcelain=v1", "-z",
-                  "--untracked-files=normal")
+                  "--untracked-files=normal", *selected)
     diff = _git(root, "diff", "--no-ext-diff", "--no-textconv",
-                "--binary", "HEAD", "--")
+                "--binary", "HEAD", *selected)
     return hashlib.sha256(status + b"\0" + diff).hexdigest()
 
 
