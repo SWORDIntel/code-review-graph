@@ -85,7 +85,7 @@ def _edge_record(root: Path, edge: Any, mapped: dict[str, str]) -> dict:
     location = _relative(root, edge.file_path)
     line = int(edge.line or 0)
     edge_id = hashlib.sha256(
-        json.dumps([source or "", target or "", relation, location, line],
+        json.dumps([edge.id, source or "", target or "", relation, location, line],
                    separators=(",", ":"), ensure_ascii=True).encode("ascii")
     ).hexdigest()
     return {
@@ -120,10 +120,11 @@ def export_qihse_snapshot(store: Any, output_path: Path, repo_root: Path) -> dic
         source = root / rel
         if not source.is_file() or source.is_symlink():
             raise ValueError(f"CRG graph stale (missing/nonregular source): {rel}")
-        if expected:
-            actual = hashlib.sha256(source.read_bytes()).hexdigest()
-            if actual != expected:
-                raise ValueError(f"CRG graph stale (source changed): {rel}; run update")
+        if not expected or len(expected) != 64:
+            raise ValueError(f"CRG graph lacks a usable source hash: {rel}; run build")
+        actual = hashlib.sha256(source.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ValueError(f"CRG graph stale (source changed): {rel}; run update")
 
     nodes = store.get_all_nodes(exclude_files=False)
     mapped: dict[str, str] = {}
@@ -193,7 +194,7 @@ def export_qihse_snapshot(store: Any, output_path: Path, repo_root: Path) -> dic
             temp_path.unlink(missing_ok=True)
 
     return {
-        "format": FORMAT, "path": str(output_path), **counts,
+        "format": FORMAT, "file": output_path.name, **counts,
         "head": previous_head, "worktree": previous_status,
         "sha256": digest.hexdigest(),
     }
