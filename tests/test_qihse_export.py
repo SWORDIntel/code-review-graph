@@ -84,7 +84,7 @@ def test_canonical_export(tmp_path):
 
 def test_unresolved_is_never_guessed(tmp_path):
     root = _repo(tmp_path)
-    output = root / "graph.jsonl"
+    output = tmp_path / "graph.jsonl"
     result = export_qihse_snapshot(FakeGraph(root, unresolved=True), output, root)
     edge = [json.loads(line) for line in output.read_text().splitlines()
             if json.loads(line)["t"] == "e"][0]
@@ -95,7 +95,7 @@ def test_unresolved_is_never_guessed(tmp_path):
 
 def test_stale_index_never_overwrites_snapshot(tmp_path):
     root = _repo(tmp_path)
-    output = root / "graph.jsonl"
+    output = tmp_path / "graph.jsonl"
     store = FakeGraph(root)
     export_qihse_snapshot(store, output, root)
     original = output.read_bytes()
@@ -107,7 +107,7 @@ def test_stale_index_never_overwrites_snapshot(tmp_path):
 
 def test_ambiguous_edge_not_promoted(tmp_path):
     root = _repo(tmp_path)
-    output = root / "graph.jsonl"
+    output = tmp_path / "graph.jsonl"
     store = FakeGraph(root)
     store.edges[0].confidence_tier = "HEURISTIC"
     export_qihse_snapshot(store, output, root)
