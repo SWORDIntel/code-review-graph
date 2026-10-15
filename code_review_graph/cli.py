@@ -1296,7 +1296,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vis_cmd.add_argument(
         "--format",
-        choices=["html", "json", "graphml", "cypher", "obsidian", "svg"],
+        choices=["html", "json", "graphml", "cypher", "obsidian", "svg", "qihse"],
         default="html",
         help="Export format (default: html)",
     )
@@ -2383,7 +2383,14 @@ def _dispatch() -> None:
                 data_dir = get_data_dir(repo_root)
             fmt = getattr(args, "format", "html") or "html"
 
-            if fmt == "json":
+            if fmt == "qihse":
+                from .qihse_export import export_qihse_snapshot
+
+                out = data_dir / "graph.qihse.jsonl"
+                result = export_qihse_snapshot(store, out, repo_root)
+                print("QIHSE CodeGraph exported: " + json.dumps(
+                    result, sort_keys=True, ensure_ascii=True))
+            elif fmt == "json":
                 from .exports import export_json
 
                 out = data_dir / "graph.json"
