@@ -31,6 +31,50 @@ def _git(repo: Path, *args: str) -> bytes:
     ).stdout
 
 
+def test_nested_untracked_git_identity_tracks_its_contents(repository):
+    nested = repository / "nested"
+    nested.mkdir()
+    _git(nested, "init", "-q")
+    source = nested / "module.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    _git(nested, "add", "module.py")
+    _git(nested, "-c", "user.email=test@example.invalid", "-c", "user.name=test",
+         "commit", "-qm", "initial")
+    listing = _git(repository, "ls-files", "--others", "--exclude-standard", "-z",
+                   "--", ".", ":(exclude).code-review-graph")
+    assert listing == b"nested/\0"
+
+    first = _header(repository)
+    source.write_text("value = 2\n", encoding="utf-8")
+    second = _header(repository)
+    assert first["worktree"] == second["worktree"]
+    assert first["worktree_v2"] != second["worktree_v2"]
+
+    nested_status = _git(nested, "status", "--porcelain=v1", "-z",
+                         "--untracked-files=normal", "--", ".",
+                         ":(exclude).code-review-graph")
+    nested_diff = _git(nested, "diff", "--no-ext-diff", "--no-textconv",
+                       "--binary", "HEAD", "--", ".", ":(exclude).code-review-graph")
+    nested_index = _git(nested, "ls-files", "--stage", "-z", "--", ".",
+                        ":(exclude).code-review-graph")
+    nested_v2 = hashlib.sha256(nested_status + b"\0" + nested_diff + b"\0" +
+                               nested_index + b"\0").hexdigest().encode("ascii")
+    nested_head = _git(nested, "rev-parse", "HEAD").strip()
+    nested_content = hashlib.sha256(b"qihse-nested-git-v1\0" + nested_head + b"\0" +
+                                    nested_v2).hexdigest().encode("ascii")
+    outer_status = _git(repository, "status", "--porcelain=v1", "-z",
+                        "--untracked-files=normal", "--", ".",
+                        ":(exclude).code-review-graph")
+    outer_diff = _git(repository, "diff", "--no-ext-diff", "--no-textconv",
+                      "--binary", "HEAD", "--", ".", ":(exclude).code-review-graph")
+    outer_index = _git(repository, "ls-files", "--stage", "-z", "--", ".",
+                       ":(exclude).code-review-graph")
+    assert second["worktree_v2"] == hashlib.sha256(
+        outer_status + b"\0" + outer_diff + b"\0" + outer_index + b"\0" +
+        b"nested/\0r\0" + nested_content + b"\0"
+    ).hexdigest()
+
+
 def test_qihse_export_records_integrity_and_traversal(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

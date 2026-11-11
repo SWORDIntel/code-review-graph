@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
@@ -39,9 +40,13 @@ def _qihse_repo_path(value: str, repo_root: Path) -> str:
     return value
 
 
-def _qihse_git(repo_root: Path, *args: str) -> bytes:
+def _qihse_git(repo_root: Path, *args: str, deadline: float | None = None) -> bytes:
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise ValueError("QIHSE source identity timed out")
     result = subprocess.run(
         ["git", *args], cwd=repo_root, capture_output=True, check=True,
+        timeout=remaining,
     )
     return result.stdout
 
@@ -49,27 +54,65 @@ def _qihse_git(repo_root: Path, *args: str) -> bytes:
 _QIHSE_FRESHNESS = "git-status-diff-index-untracked-v2"
 
 
-def _qihse_identity(repo_root: Path) -> tuple[str, str, str]:
-    """Bind tracked changes, index entries and nonignored untracked contents."""
-    head = _qihse_git(repo_root, "rev-parse", "HEAD").decode("ascii").strip()
+def _qihse_identity(
+    repo_root: Path, *, _depth: int = 0, _budget: dict | None = None,
+) -> tuple[str, str, str]:
+    """Bind tracked changes, index entries and nested untracked Git repositories."""
+    if _depth > 4:
+        raise ValueError("Nested Git source identity exceeds depth limit")
+    repo_root = repo_root.resolve(strict=True)
+    if _budget is None:
+        _budget = {"deadline": time.monotonic() + 90.0, "paths": 0,
+                   "listing_bytes": 0}
+    deadline = _budget["deadline"]
+    head = _qihse_git(repo_root, "rev-parse", "HEAD", deadline=deadline).decode("ascii").strip()
     pathspec = ("--", ".", ":(exclude).code-review-graph")
     status = _qihse_git(
         repo_root, "status", "--porcelain=v1", "-z", "--untracked-files=normal", *pathspec,
+        deadline=deadline,
     )
     diff = _qihse_git(
         repo_root, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", *pathspec,
+        deadline=deadline,
     )
-    index = _qihse_git(repo_root, "ls-files", "--stage", "-z", *pathspec)
+    index = _qihse_git(repo_root, "ls-files", "--stage", "-z", *pathspec,
+                       deadline=deadline)
     untracked = _qihse_git(repo_root, "ls-files", "--others", "--exclude-standard", "-z",
-                           *pathspec)
+                           *pathspec, deadline=deadline)
+    _budget["listing_bytes"] += len(untracked)
+    if _budget["listing_bytes"] > 64 * 1024 * 1024:
+        raise ValueError("QIHSE untracked source listing exceeds limit")
     digest = hashlib.sha256(status + b"\0" + diff + b"\0" + index + b"\0")
     for name in untracked.split(b"\0"):
         if not name:
             continue
-        path = os.path.join(os.fsencode(repo_root), name)
+        _budget["paths"] += 1
+        if _budget["paths"] > 200000 or time.monotonic() >= deadline:
+            raise ValueError("QIHSE untracked source verification limit exceeded")
+        relative = name[:-1] if name.endswith(b"/") else name
+        if not relative or relative.startswith(b"/") or b".." in relative.split(b"/"):
+            raise ValueError("Invalid untracked source path")
+        path = os.path.join(os.fsencode(repo_root), relative)
         mode = os.lstat(path).st_mode
         content = hashlib.sha256()
-        if stat.S_ISLNK(mode):
+        if name.endswith(b"/"):
+            marker = os.path.join(path, b".git")
+            marker_mode = os.lstat(marker).st_mode
+            if not stat.S_ISDIR(mode) or not (stat.S_ISDIR(marker_mode) or
+                                              stat.S_ISREG(marker_mode)):
+                raise ValueError("Untracked nested repository is not verifiable")
+            nested = Path(os.fsdecode(path)).resolve(strict=True)
+            if not nested.is_relative_to(repo_root) or _qihse_git(
+                nested, "rev-parse", "--show-toplevel", deadline=deadline,
+            ).decode().strip() != str(nested):
+                raise ValueError("Untracked nested repository has the wrong root")
+            nested_head, _, nested_v2 = _qihse_identity(
+                nested, _depth=_depth + 1, _budget=_budget,
+            )
+            kind = b"r"
+            content.update(b"qihse-nested-git-v1\0" + nested_head.encode("ascii") +
+                           b"\0" + nested_v2.encode("ascii"))
+        elif stat.S_ISLNK(mode):
             kind = b"l"
             content.update(os.readlink(path))
         elif stat.S_ISREG(mode):
@@ -79,6 +122,8 @@ def _qihse_identity(repo_root: Path) -> tuple[str, str, str]:
                     content.update(chunk)
         else:
             raise ValueError(f"unsupported untracked file type: {os.fsdecode(name)!r}")
+        if time.monotonic() >= deadline:
+            raise ValueError("QIHSE untracked source verification timed out")
         digest.update(name + b"\0" + kind + b"\0" + content.hexdigest().encode("ascii") + b"\0")
     return head, hashlib.sha256(status + b"\0" + diff).hexdigest(), digest.hexdigest()
 
