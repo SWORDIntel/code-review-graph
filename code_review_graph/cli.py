@@ -2384,10 +2384,12 @@ def _dispatch() -> None:
             fmt = getattr(args, "format", "html") or "html"
 
             if fmt == "qihse":
-                from .qihse_export import export_qihse_snapshot
+                from .exports import export_qihse
+                from .qihse_export import summarize_qihse_snapshot
 
                 out = data_dir / "graph.qihse.jsonl"
-                result = export_qihse_snapshot(store, out, repo_root)
+                export_qihse(store, out, repo_root)
+                result = summarize_qihse_snapshot(out)
                 print("QIHSE CodeGraph exported: " + json.dumps(
                     result, sort_keys=True, ensure_ascii=True))
             elif fmt == "json":

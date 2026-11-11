@@ -158,6 +158,28 @@ def test_visualize_json_uses_local_export(tmp_path, capsys):
 
     export_json.assert_called_once_with(store, data_dir / "graph.json")
     assert "JSON exported:" in capsys.readouterr().out
+
+
+def test_visualize_qihse_uses_native_export(tmp_path, capsys):
+    argv = ["code-review-graph", "visualize", "--repo", str(tmp_path),
+            "--format", "qihse"]
+    data_dir = tmp_path / ".code-review-graph"
+    data_dir.mkdir()
+    db_path = data_dir / "graph.db"
+    db_path.touch()
+    store = MagicMock()
+
+    with patch.object(sys, "argv", argv):
+        with patch("code_review_graph.graph.GraphStore", return_value=store):
+            with patch("code_review_graph.incremental.get_db_path", return_value=db_path):
+                with patch("code_review_graph.incremental.get_data_dir", return_value=data_dir):
+                    with patch("code_review_graph.exports.export_qihse") as export_qihse:
+                        with patch("code_review_graph.qihse_export.summarize_qihse_snapshot",
+                                   return_value={"file": "graph.qihse.jsonl"}):
+                            cli.main()
+
+    export_qihse.assert_called_once_with(store, data_dir / "graph.qihse.jsonl", tmp_path)
+    assert "QIHSE CodeGraph exported:" in capsys.readouterr().out
     store.close.assert_called_once()
 
 

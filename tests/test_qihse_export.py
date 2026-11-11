@@ -72,11 +72,11 @@ def test_canonical_export(tmp_path):
     assert result["nodes"] == 2 and result["edges"] == 1
     assert records[3]["traversable"] is True
     assert records[3]["resolution"] == "direct"
-    assert records[-1]["sha256"] == hashlib.sha256(
-        b"".join((json.dumps(row, sort_keys=True, ensure_ascii=True,
-                             separators=(",", ":")) + "\n").encode("ascii")
-                 for row in records[:-1])
-    ).hexdigest()
+    raw_lines = output.read_bytes().splitlines(keepends=True)
+    assert records[-1]["sha256"] == hashlib.sha256(b"".join(raw_lines[:-1])).hexdigest()
+    assert records[0]["freshness"] == "git-status-diff-index-untracked-v2"
+    assert len(records[0]["worktree_v2"]) == 64
+    assert records[0]["id_algorithm"] == "xxh3-128"
     # Native persistence receives only repo-relative paths.
     assert str(root) not in output.read_text()
     assert records[1]["file"] == "src/a.py"
@@ -100,7 +100,7 @@ def test_stale_index_never_overwrites_snapshot(tmp_path):
     export_qihse_snapshot(store, output, root)
     original = output.read_bytes()
     (root / "src/a.py").write_text("updated()\n")
-    with pytest.raises(ValueError, match="stale"):
+    with pytest.raises(ValueError, match="indexed source changed"):
         export_qihse_snapshot(store, output, root)
     assert output.read_bytes() == original
 
