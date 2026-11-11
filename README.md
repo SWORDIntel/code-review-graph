@@ -534,12 +534,14 @@ Optional dependency groups:
 ```bash
 pip install "code-review-graph[embeddings]"          # Local vector embeddings (sentence-transformers)
 pip install "code-review-graph[google-embeddings]"   # Google Gemini embeddings
-pip install "code-review-graph[communities]"         # Community detection (igraph)
 pip install "code-review-graph[enrichment]"          # Python call-resolution enrichment (Jedi)
 pip install "code-review-graph[eval]"                # Evaluation benchmarks and SVG export (matplotlib)
 pip install "code-review-graph[wiki]"                # ollama client (not used by the current wiki generator)
 pip install "code-review-graph[all]"                 # All optional dependencies
 ```
+
+The standard install includes `igraph` for Leiden community detection. The
+`[communities]` extra remains a compatible alias for existing install commands.
 
 ### Environment Variables
 

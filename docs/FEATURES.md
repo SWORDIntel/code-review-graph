@@ -71,7 +71,7 @@ Release highlights by version. The full changelog is in [CHANGELOG.md](../CHANGE
 - **Multi-repo registry**: register several repositories and search across them with `cross_repo_search`.
 - **Full-text search**: FTS5 virtual table with porter stemming for hybrid keyword and vector search.
 - **Database migrations**: versioned schema migrations with automatic upgrade on startup.
-- **Optional dependency groups**: `[embeddings]`, `[google-embeddings]`, `[communities]`, `[eval]`, `[wiki]`, `[all]`.
+- **Dependencies**: a standard install includes igraph for Leiden community detection. Optional groups include `[embeddings]`, `[google-embeddings]`, `[eval]`, `[wiki]`, and `[all]`; `[communities]` remains a compatible alias.
 - **Evaluation framework**: benchmark suite with matplotlib reports.
 - **TypeScript path resolution**: tsconfig.json `paths`/`baseUrl` alias resolution for imports.
 

@@ -443,11 +443,13 @@ off for the whole repository.
 - On native Windows, long paths may need enabling:
   `git config --system core.longpaths true`.
 
-## Community detection requires igraph
+## Community detection and igraph
 
-- Install with `pip install "code-review-graph[communities]"`.
-- Without igraph, community detection falls back to file-based grouping, which
-  is coarser.
+- A standard `pip install code-review-graph` or `pipx install code-review-graph`
+  installs igraph for Leiden clustering. Upgrade an older pipx environment with
+  `pipx reinstall code-review-graph`.
+- If igraph cannot be imported in a custom environment, community detection
+  falls back to coarser file-based grouping.
 
 ## Optional dependency groups
 
@@ -458,8 +460,8 @@ If a tool returns an ImportError, install the relevant group:
 - `pip install "code-review-graph[google-embeddings]"`: Google Gemini embeddings.
   OpenAI-compatible, MiniMax and Voyage AI embeddings use the standard library
   HTTP client and need only their environment variables.
-- `pip install "code-review-graph[communities]"`: igraph-based community
-  detection.
+- `igraph` is included in the standard install; `[communities]` remains a
+  compatible alias.
 - `pip install "code-review-graph[enrichment]"`: Python call-resolution
   enrichment through Jedi.
 - `pip install "code-review-graph[eval]"`: evaluation benchmarks (matplotlib,

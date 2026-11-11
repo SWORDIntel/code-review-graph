@@ -728,7 +728,6 @@ def test_declared_dependencies_are_sufficient(wheel_env: InstalledEnv) -> None:
     extras = [
         "numpy",
         "sentence-transformers",
-        "igraph",
         "jedi",
         "matplotlib",
         "ollama",
@@ -776,7 +775,7 @@ def test_declared_dependencies_are_sufficient(wheel_env: InstalledEnv) -> None:
         for spec in payload["requires"]
         if "extra ==" not in spec
     }
-    for name in ("mcp", "fastmcp", "tree-sitter", "networkx", "pyyaml", "watchdog"):
+    for name in ("mcp", "fastmcp", "tree-sitter", "networkx", "igraph", "pyyaml", "watchdog"):
         assert name in unconditional, f"{name} is not a declared runtime dependency"
 
 
