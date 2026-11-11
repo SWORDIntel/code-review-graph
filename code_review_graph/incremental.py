@@ -24,10 +24,18 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from .build_state import advance_to_postprocess_pending
 from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
-from .constants import discovery_timeout, env_float, env_int
+from .constants import (
+    IMPORT_SCOPE_KEY,
+    IMPORT_SCOPE_PACKAGE,
+    IMPORT_SCOPE_TREE,
+    discovery_timeout,
+    env_float,
+    env_int,
+)
 from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
+from .qihse_progress import report as _report_progress
 
 _MAX_PARSE_WORKERS = env_int("CRG_PARSE_WORKERS", min(os.cpu_count() or 4, 8))
 
@@ -1489,6 +1497,7 @@ def _reconcile_stale_files(
     current_files: list[str] | None = None,
     *,
     known_text: set[str] | None = None,
+    remove: bool = True,
 ) -> list[str]:
     """Remove graph files absent from the current parseable repository inventory.
 
@@ -1523,7 +1532,7 @@ def _reconcile_stale_files(
             ):
                 current_paths.add(stored_file)
     stale_files = sorted(stored_files - current_paths)
-    if stale_files:
+    if stale_files and remove:
         store.remove_files_permanently(stale_files, stored_paths=True)
     return stale_files
 
@@ -1626,20 +1635,37 @@ _MAX_DEPENDENT_HOPS = env_int("CRG_DEPENDENT_HOPS", 2)
 _MAX_DEPENDENT_FILES = 500
 
 
-def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
+def _single_hop_dependents(
+    store: GraphStore, file_path: str, *, all_relationships: bool = False,
+) -> set[str]:
     """Find files that directly depend on *file_path* (single hop)."""
     dependents: set[str] = set()
     edges = store.get_edges_by_target(file_path)
     for e in edges:
-        if e.kind == "IMPORTS_FROM":
+        if all_relationships or e.kind == "IMPORTS_FROM":
             dependents.add(e.file_path)
 
     nodes = store.get_nodes_by_file(file_path)
     for node in nodes:
         for e in store.get_edges_by_target(node.qualified_name):
-            if e.kind in ("CALLS", "IMPORTS_FROM", "INHERITS", "IMPLEMENTS"):
+            if all_relationships or e.kind in ("CALLS", "IMPORTS_FROM", "INHERITS", "IMPLEMENTS"):
                 dependents.add(e.file_path)
 
+    if all_relationships:
+        # Evidence can be owned by another file even when the changed symbol is
+        # the edge source (for example TESTED_BY or event-handler relations).
+        for endpoint in [file_path, *(node.qualified_name for node in nodes)]:
+            dependents.update(edge.file_path for edge in store.get_edges_by_source(endpoint))
+        scopes = store.tree_scope_bridges([file_path]) | {str(Path(file_path).parent)}
+        for directory in scopes:
+            for edge in store.get_edges_by_target(directory):
+                if (
+                    edge.kind == "IMPORTS_FROM"
+                    and edge.extra.get(IMPORT_SCOPE_KEY) in (
+                        IMPORT_SCOPE_PACKAGE, IMPORT_SCOPE_TREE,
+                    )
+                ):
+                    dependents.add(edge.file_path)
     dependents.discard(file_path)
     return dependents
 
@@ -1667,6 +1693,7 @@ def find_dependents(
     store: GraphStore,
     file_path: str,
     max_hops: int = _MAX_DEPENDENT_HOPS,
+    *, all_relationships: bool = False,
 ) -> DependentList:
     """Find files that import from or depend on the given file.
 
@@ -1684,7 +1711,8 @@ def find_dependents(
     for _hop in range(max_hops):
         next_frontier: set[str] = set()
         for fp in frontier:
-            deps = _single_hop_dependents(store, fp)
+            deps = (_single_hop_dependents(store, fp, all_relationships=True)
+                    if all_relationships else _single_hop_dependents(store, fp))
             new_deps = deps - visited
             all_dependents.update(new_deps)
             next_frontier.update(new_deps)
@@ -1764,6 +1792,7 @@ def full_build(
     errors = []
     cpp_errors: set[str] = set()
     file_count = len(files)
+    _report_progress("parse", "files", 0, file_count)
 
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
 
@@ -1786,6 +1815,7 @@ def full_build(
                 errors.append({"file": rel_path, "error": str(e)})
                 if parser.detect_language(full_path) == "cpp":
                     cpp_errors.add(str(rel_path))
+            _report_progress("parse", "files", i, file_count)
             if parsed is not None:
                 # Deliberately outside the handlers above. A file this loop
                 # could not *parse* is reported and keeps no rows; a file it
@@ -1812,6 +1842,7 @@ def full_build(
                 executor.map(_parse_single_file, args_list, chunksize=20),
                 1,
             ):
+                _report_progress("parse", "files", i, file_count)
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
@@ -1886,12 +1917,17 @@ def _relative_update_input(repo_root: Path, path: str) -> str:
         return path
 
 
+class IncrementalCoverageError(RuntimeError):
+    """The bounded invalidation walk cannot certify complete incremental coverage."""
+
+
 def incremental_update(
     repo_root: Path,
     store: GraphStore,
     base: str = "HEAD~1",
     changed_files: list[str] | None = None,
     reconcile_stale: bool = True,
+    exact_dependencies: bool = False,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
     repo_root = _canonical_repo_root(repo_root)
@@ -1959,22 +1995,35 @@ def incremental_update(
         )
     )
     stale_files = (
-        _reconcile_stale_files(repo_root, store, known_text=known_text)
+        _reconcile_stale_files(repo_root, store, known_text=known_text, remove=False)
         if reconcile_stale
         else []
     )
 
     # Find dependent files (files that import from changed files)
     dependent_files: set[str] = set()
-    for rel_path in changed_files:
+    dependency_hops = (max(1, len(store.get_all_files())) if exact_dependencies
+                       else _MAX_DEPENDENT_HOPS)
+    # Resolve dependencies before deleting stale nodes: their incoming calls and
+    # imports are the only evidence identifying unchanged consumers to reparse.
+    for rel_path in [*changed_files, *stale_files]:
         full_path = normalize_file_path(repo_root / rel_path)
-        deps = find_dependents(store, full_path)
+        deps = (find_dependents(store, full_path, max_hops=dependency_hops,
+                                all_relationships=True)
+                if exact_dependencies else find_dependents(store, full_path))
+        if exact_dependencies and deps.truncated:
+            raise IncrementalCoverageError(
+                'Dependent invalidation exceeds its bounded complete walk',
+            )
         for d in deps:
             # Convert back to relative path if needed
             try:
                 dependent_files.add(str(Path(d).relative_to(repo_root)))
             except ValueError:
                 dependent_files.add(d)
+
+    if stale_files:
+        store.remove_files_permanently(stale_files, stored_paths=True)
 
     # Combine changed + dependent
     all_files = set(changed_files) | dependent_files | (identity_pending or set())
@@ -2025,6 +2074,7 @@ def incremental_update(
             existing_nodes = store.get_nodes_by_file(str(abs_path))
             if (
                 rel_path not in remaining_identity
+                and rel_path not in dependent_files
                 and fhash is not None
                 and existing_nodes
                 and existing_nodes[0].file_hash == fhash
@@ -2038,9 +2088,10 @@ def incremental_update(
     # explicit transaction — avoids nested transaction errors.
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
     parsed_files = 0
+    _report_progress("parse", "files", 0, len(to_parse))
 
     if use_serial or len(to_parse) < 8:
-        for rel_path in to_parse:
+        for progress_i, rel_path in enumerate(to_parse, 1):
             abs_path = repo_root / rel_path
             try:
                 source = abs_path.read_bytes()
@@ -2048,11 +2099,14 @@ def incremental_update(
                 nodes, edges = parser.parse_bytes(abs_path, source)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
+                _report_progress("parse", "files", progress_i, len(to_parse))
                 continue
             except Exception as e:
                 logger.warning("Error parsing %s: %s", rel_path, e)
                 errors.append({"file": rel_path, "error": str(e)})
+                _report_progress("parse", "files", progress_i, len(to_parse))
                 continue
+            _report_progress("parse", "files", progress_i, len(to_parse))
             # Same reasoning as the serial loop in full_build: a failed write
             # is not a failed parse. Letting it propagate stops the update
             # before the freshness anchor is advanced, so the next run still
@@ -2066,11 +2120,12 @@ def incremental_update(
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in executor.map(
+            for progress_i, (rel_path, nodes, edges, error, fhash) in enumerate(executor.map(
                 _parse_single_file,
                 args_list,
                 chunksize=20,
-            ):
+            ), 1):
+                _report_progress("parse", "files", progress_i, len(to_parse))
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})

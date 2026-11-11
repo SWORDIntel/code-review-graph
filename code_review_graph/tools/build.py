@@ -18,6 +18,7 @@ from ..build_state import (
     read_build_state,
 )
 from ..incremental import (
+    IncrementalCoverageError,
     full_build,
     incremental_update,
     resolve_incremental_base,
@@ -602,6 +603,7 @@ def build_or_update_graph(
     recurse_submodules: bool | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    exact_dependencies: bool = False,
 ) -> dict[str, Any]:
     """Build or incrementally update the code knowledge graph.
 
@@ -680,7 +682,8 @@ def build_or_update_graph(
             }
         else:
             try:
-                result = incremental_update(root, store, base=base_resolved)
+                kwargs = {"exact_dependencies": True} if exact_dependencies else {}
+                result = incremental_update(root, store, base=base_resolved, **kwargs)
             except RuntimeError as exc:
                 # Change discovery or root validation failed before anything was
                 # stored; report it the way every other failure is reported.
@@ -695,6 +698,7 @@ def build_or_update_graph(
                     "files_updated": 0,
                     "errors": [],
                     "error": str(exc),
+                    "full_rebuild_required": isinstance(exc, IncrementalCoverageError),
                     "summary": f"Incremental update failed: {exc}",
                     "postprocess_level": postprocess,
                 }
@@ -799,6 +803,8 @@ def run_postprocess(
             supplied with ``embedding_model``. Default: disabled.
         embedding_model: Exact model for an explicit refresh. Must be supplied
             with ``embedding_provider``. Default: disabled.
+        exact_dependencies: Require complete transitive invalidation; return
+            ``full_rebuild_required`` if its bounded walk cannot certify coverage.
 
     Returns:
         Summary of what was computed.

@@ -2,18 +2,359 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import logging
 import os
 import re
+import stat
+import subprocess
 import tempfile
-from pathlib import Path
+from collections.abc import Callable
+from pathlib import Path, PurePosixPath
 
+from .build_state import BUILD_STATE_KEY, INCOMPLETE_BUILD_STATES
 from .graph import GraphStore, _sanitize_name
+from .qihse_progress import report as _report_progress
+from .qihse_xxh3 import hash_many as _xxh3_many
+from .qihse_xxh3 import hash_one as _xxh3_one
 from .visualization import export_graph_data
 
 logger = logging.getLogger(__name__)
+
+
+def _qihse_repo_path(value: str, repo_root: Path) -> str:
+    """Require a graph path that stays inside the repository."""
+    if Path(value).is_absolute():
+        try:
+            value = Path(value).relative_to(repo_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"graph path is outside repository: {value!r}") from exc
+    path = PurePosixPath(value)
+    if not value or "\\" in value or path.is_absolute() or any(
+        part in ("", ".", "..") for part in value.split("/")
+    ):
+        raise ValueError(f"unsafe graph path: {value!r}")
+    return value
+
+
+def _qihse_git(repo_root: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", *args], cwd=repo_root, capture_output=True, check=True,
+    )
+    return result.stdout
+
+
+_QIHSE_FRESHNESS = "git-status-diff-index-untracked-v2"
+
+
+def _qihse_identity(repo_root: Path) -> tuple[str, str, str]:
+    """Bind tracked changes, index entries and nonignored untracked contents."""
+    head = _qihse_git(repo_root, "rev-parse", "HEAD").decode("ascii").strip()
+    pathspec = ("--", ".", ":(exclude).code-review-graph")
+    status = _qihse_git(
+        repo_root, "status", "--porcelain=v1", "-z", "--untracked-files=normal", *pathspec,
+    )
+    diff = _qihse_git(
+        repo_root, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", *pathspec,
+    )
+    index = _qihse_git(repo_root, "ls-files", "--stage", "-z", *pathspec)
+    untracked = _qihse_git(repo_root, "ls-files", "--others", "--exclude-standard", "-z",
+                           *pathspec)
+    digest = hashlib.sha256(status + b"\0" + diff + b"\0" + index + b"\0")
+    for name in untracked.split(b"\0"):
+        if not name:
+            continue
+        path = os.path.join(os.fsencode(repo_root), name)
+        mode = os.lstat(path).st_mode
+        content = hashlib.sha256()
+        if stat.S_ISLNK(mode):
+            kind = b"l"
+            content.update(os.readlink(path))
+        elif stat.S_ISREG(mode):
+            kind = b"f"
+            with open(path, "rb") as source:
+                for chunk in iter(lambda: source.read(131072), b""):
+                    content.update(chunk)
+        else:
+            raise ValueError(f"unsupported untracked file type: {os.fsdecode(name)!r}")
+        digest.update(name + b"\0" + kind + b"\0" + content.hexdigest().encode("ascii") + b"\0")
+    return head, hashlib.sha256(status + b"\0" + diff).hexdigest(), digest.hexdigest()
+
+
+_QIHSE_ID_COLLISION_ATTEMPTS = 256
+_QIHSE_ID_COLLISION_DOMAIN = b"qihse-id-collision-xxh3-v1\0"
+_QIHSE_PUBLIC_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def _qihse_id_digest(preimage: bytes) -> str:
+    """Standard unseeded XXH3-128 in canonical byte order."""
+    return _xxh3_one(preimage)
+
+
+def _qihse_id_digests(preimages: list[bytes]) -> list[str]:
+    return _xxh3_many(preimages)
+
+
+def _qihse_node_identity(qualified_name: str) -> bytes:
+    name = qualified_name.encode("utf-8")
+    return b"qihse-node-128-v1\0" + len(name).to_bytes(8, "big") + name
+
+
+def _qihse_checked_id(
+    preimage: bytes, identities: dict[str, bytes], initial: str | None = None,
+) -> str:
+    """Resolve collisions by deterministic rehashing; never merge distinct facts.
+
+    Attempt zero hashes the original framed identity. Retries hash the explicit
+    collision domain, original byte length and bytes, and an unsigned 64-bit
+    big-endian counter. Canonical export order makes allocation reproducible.
+    The registry always compares the complete original identity, not a digest.
+    """
+    for attempt in range(_QIHSE_ID_COLLISION_ATTEMPTS):
+        framed = preimage if attempt == 0 else (
+            _QIHSE_ID_COLLISION_DOMAIN + len(preimage).to_bytes(8, "big") + preimage
+            + attempt.to_bytes(8, "big")
+        )
+        digest = initial if attempt == 0 and initial is not None else _qihse_id_digest(framed)
+        if not isinstance(digest, str) or not _QIHSE_PUBLIC_ID.fullmatch(digest):
+            raise ValueError("invalid QIHSE public identity digest")
+        previous = identities.get(digest)
+        if previous is None or previous == preimage:
+            identities[digest] = preimage
+            return digest
+    raise ValueError("QIHSE graph identity collision resolution exhausted")
+
+
+def _qihse_edge_identity(fields: tuple[str, ...], occurrence: int) -> bytes:
+    """Versioned, length-framed semantic site, independent of SQLite row IDs."""
+    framed = bytearray(b"qihse-edge-site-v2\0")
+    for field in fields:
+        encoded = field.encode("utf-8")
+        framed.extend(len(encoded).to_bytes(8, "big"))
+        framed.extend(encoded)
+    framed.extend(occurrence.to_bytes(8, "big"))
+    return bytes(framed)
+
+
+
+
+def _qihse_qualified_identity(value: str, repo_root: Path) -> str:
+    """Remove only this workspace's absolute prefix from qualified identities.
+
+    A materialized editor view has another temporary directory on every run.
+    Persisting that prefix would rename every public ID without a source change.
+    External unresolved identities remain opaque, not basename-collapsed.
+    """
+    file_part, separator, symbol = value.partition('::')
+    path = Path(file_part)
+    if path.is_absolute():
+        try:
+            file_part = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            return value
+    return file_part + separator + symbol
+
+
+def _qihse_graph_records(store: GraphStore):
+    """Capture complete source rows from one non-degrading SQLite snapshot."""
+    if not isinstance(store, GraphStore):
+        # Lightweight immutable source providers used by callers/tests do not
+        # have a SQLite connection or a build-state journal.
+        return store.get_all_nodes(exclude_files=False), store.get_all_edges()
+    with store._read_transaction():
+        token = store._active_read_txn
+        changes = store._conn.total_changes
+        if token is None or not store._conn.in_transaction:
+            raise ValueError('QIHSE export could not pin a source-index read snapshot')
+        if store.get_metadata(BUILD_STATE_KEY) in INCOMPLETE_BUILD_STATES:
+            raise ValueError('QIHSE export refuses an incomplete source graph')
+        nodes = store.get_all_nodes(exclude_files=False)
+        edges = store.get_all_edges()
+        if (store._active_read_txn is not token or not store._conn.in_transaction
+                or store._conn.total_changes != changes):
+            raise ValueError('Source-index snapshot changed during QIHSE row capture')
+    return nodes, edges
+
+
+def export_qihse(
+    store: GraphStore, output_path: Path, repo_root: Path, *,
+    source_identity_provider: Callable[[Path], tuple[str, str, str]] | None = None,
+) -> Path:
+    """Export a repository-bound, integrity-checked qihse-codegraph-v1 stream."""
+    repo_root = repo_root.resolve()
+    identity_provider = source_identity_provider or _qihse_identity
+    head, worktree, worktree_v2 = identity_provider(repo_root)
+    nodes, edges = _qihse_graph_records(store)
+    nodes.sort(key=lambda node: _qihse_qualified_identity(node.qualified_name, repo_root))
+    source_hashes: dict[str, str] = {}
+    for node in nodes:
+        if not node.file_hash:
+            if node.kind == "File" and not node.extra.get("virtual"):
+                raise ValueError(f"indexed source has no content hash: {node.file_path!r}")
+            continue
+        if len(node.file_hash) != 64 or any(c not in "0123456789abcdef" for c in node.file_hash):
+            raise ValueError(f"invalid indexed source hash: {node.file_path!r}")
+        path = _qihse_repo_path(node.file_path, repo_root)
+        if path in source_hashes and source_hashes[path] != node.file_hash:
+            raise ValueError(f"inconsistent indexed source hashes: {path!r}")
+        source_hashes[path] = node.file_hash
+
+    def verify_sources() -> None:
+        for path, expected in source_hashes.items():
+            source = repo_root / path
+            if not source.resolve().is_relative_to(repo_root.resolve()) or not source.is_file():
+                raise ValueError(f"indexed source is unavailable or outside repository: {path!r}")
+            digest = hashlib.sha256()
+            with source.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(131072), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected:
+                raise ValueError(
+                    f"indexed source changed; refresh the graph before export: {path!r}",
+                )
+
+    verify_sources()
+    identities: dict[str, bytes] = {}
+    node_ids: dict[str, str] = {}
+    qualified_names = [_qihse_qualified_identity(node.qualified_name, repo_root) for node in nodes]
+    node_frames = [_qihse_node_identity(name) for name in qualified_names]
+    node_candidates = _qihse_id_digests(node_frames)
+    for name, frame, candidate in zip(qualified_names, node_frames, node_candidates, strict=True):
+        if name in node_ids:
+            raise ValueError("duplicate QIHSE qualified node identity")
+        node_ids[name] = _qihse_checked_id(
+            frame, identities, candidate,
+        )
+
+    # Sort equal sites by their exported evidence, then number occurrences. Identical
+    # parallel records remain distinct without introducing database allocation order.
+    edge_rows = []
+    for edge in edges:
+        path = _qihse_repo_path(edge.file_path, repo_root)
+        source_name = _qihse_qualified_identity(edge.source_qualified, repo_root)
+        target_name = _qihse_qualified_identity(edge.target_qualified, repo_root)
+        site = (edge.kind, source_name, target_name, path,
+                str(max(0, edge.line)))
+        source, target = node_ids.get(source_name, ""), node_ids.get(
+            target_name, "",
+        )
+        tier = edge.confidence_tier or ""
+        resolution = edge.target_resolution or (
+            "direct" if source and target else "unresolved"
+        )
+        confidence = max(0.0, min(1.0, edge.confidence))
+        evidence = json.dumps([tier, resolution, confidence], separators=(",", ":"))
+        edge_rows.append((site, evidence, edge))
+    edge_rows.sort(key=lambda row: (row[0], row[1]))
+    edge_frames = []
+    previous_site = None
+    occurrence = 0
+    for site, _evidence, _edge in edge_rows:
+        occurrence = occurrence + 1 if site == previous_site else 0
+        previous_site = site
+        edge_frames.append(_qihse_edge_identity(site, occurrence))
+    edge_candidates = _qihse_id_digests(edge_frames)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    digest = hashlib.sha256()
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=output_path.parent, prefix=f".{output_path.name}.",
+            suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+
+            records_written = 0
+            bytes_written = 0
+            total_records = len(nodes) + len(edges) + 2
+            _report_progress("export", "records", 0, total_records)
+
+            def write_record(record: dict, *, final: bool = False) -> None:
+                nonlocal records_written, bytes_written
+                raw = (
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+                if len(raw) > 262144:
+                    raise ValueError("QIHSE record exceeds 262144 bytes")
+                handle.write(raw)
+                records_written += 1
+                bytes_written += len(raw)
+                if final or records_written % 256 == 0:
+                    _report_progress("export", "records", records_written, total_records)
+                    _report_progress("export", "bytes", bytes_written)
+                if not final:
+                    digest.update(raw)
+
+            write_record({
+                "t": "h", "format": "qihse-codegraph-v1", "version": 1,
+                "identity": "qihse-semantic-xxh3-128-v1",
+                "id_algorithm": "xxh3-128", "id_bits": 128,
+                "id_seed": 0, "id_encoding": "xxh128-canonical",
+                "id_collision": "counter-xxh3-128-v1",
+                "id_collision_attempts": _QIHSE_ID_COLLISION_ATTEMPTS,
+                "head": head, "worktree": worktree,
+                "freshness": _QIHSE_FRESHNESS, "worktree_v2": worktree_v2,
+            })
+            for node in nodes:
+                file_path = _qihse_repo_path(node.file_path, repo_root)
+                node_name = (_qihse_qualified_identity(node.name, repo_root)
+                             if node.kind == "File" else node.name)
+                if len(node.kind) > 64 or len(node_name) > 512:
+                    raise ValueError("graph node exceeds QIHSE field limit")
+                node_id = node_ids[_qihse_qualified_identity(node.qualified_name, repo_root)]
+                write_record({
+                    "t": "n", "id": node_id,
+                    "file": file_path, "kind": node.kind, "name": node_name,
+                    "line_start": max(0, node.line_start),
+                    "line_end": max(0, node.line_end),
+                    "language": node.language, "is_test": node.is_test,
+                    "file_hash": node.file_hash or "",
+                })
+            unresolved_edges = 0
+            for (site, _evidence, edge), frame, candidate in zip(
+                edge_rows, edge_frames, edge_candidates, strict=True,
+            ):
+                file_path = _qihse_repo_path(edge.file_path, repo_root)
+                if len(edge.kind) >= 32:
+                    raise ValueError("graph edge relation exceeds QIHSE field limit")
+                source = node_ids.get(site[1], "")
+                target = node_ids.get(site[2], "")
+                tier = edge.confidence_tier or ""
+                resolution = edge.target_resolution or (
+                    "direct" if source and target else "unresolved"
+                )
+                confidence = max(0.0, min(1.0, edge.confidence))
+                traversable = bool(
+                    source and target and tier == "EXTRACTED"
+                    and resolution == "direct" and confidence >= 0.8
+                )
+                unresolved_edges += not traversable
+                edge_id = _qihse_checked_id(
+                    frame, identities, candidate,
+                )
+                write_record({
+                    "t": "e", "id": edge_id, "source": source,
+                    "target": target, "relation": edge.kind, "file": file_path,
+                    "line": max(0, edge.line), "confidence": confidence,
+                    "tier": tier, "resolution": resolution,
+                    "traversable": traversable,
+                })
+            write_record({
+                "t": "end", "nodes": len(nodes), "edges": len(edges),
+                "unresolved_edges": unresolved_edges, "sha256": digest.hexdigest(),
+            }, final=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        verify_sources()
+        if identity_provider(repo_root) != (head, worktree, worktree_v2):
+            raise ValueError("repository changed during QIHSE export")
+        os.replace(temporary, output_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return output_path
 
 
 class MissingOptionalDependencyError(ImportError):
